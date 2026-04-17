@@ -4,7 +4,7 @@
 /// to a local LLM inference engine. Operates headless and event-driven.
 ///
 /// Flow:
-/// 1. Listens globally for Ctrl+Alt+J hotkey (synchronous OS listener)
+/// 1. Listens globally for Ctrl+D hotkey (synchronous OS listener)
 /// 2. On trigger, reads clipboard text
 /// 3. Spawns async task to send text to local Ollama API (localhost:11434)
 /// 4. Receives AI-generated response
@@ -92,7 +92,7 @@ async fn main() -> Result<()> {
 /// This runs on a blocking tokio thread to avoid blocking the async runtime.
 /// Spawns async tasks when hotkey is detected.
 fn os_event_listener() -> Result<()> {
-    tracing::info!("📡 Listening for Ctrl+Alt+J hotkey...");
+    tracing::info!("📡 Listening for Ctrl+D hotkey...");
 
     // Callback invoked on every OS keyboard/mouse event
     let callback = |event: Event| {
@@ -132,7 +132,7 @@ fn os_event_listener() -> Result<()> {
 // HOTKEY DETECTION
 // ============================================================================
 
-/// Determines if a keyboard event is the trigger hotkey (Ctrl+Alt+J).
+/// Determines if a keyboard event is the trigger hotkey (Ctrl+D).
 /// 
 /// Note: `rdev` only reports key down events for modifier keys when used
 /// with standard modifier detection. For production use, consider:
@@ -142,14 +142,14 @@ fn is_trigger_hotkey(key: Key) -> bool {
     // This is a simplified check. In practice, we'd need to track modifier states.
     // For the MVP, assume we're detecting global hotkeys correctly via rdev.
     // A more robust implementation would use platform-specific hotkey registration.
-    matches!(key, Key::J)
+    matches!(key, Key::D)
 }
 
 // ============================================================================
 // ASYNC HOTKEY HANDLER
 // ============================================================================
 
-/// Main async handler invoked when Ctrl+Alt+J is pressed.
+/// Main async handler invoked when Ctrl+D is pressed.
 /// Flow:
 /// 1. Read clipboard
 /// 2. Send to Ollama API

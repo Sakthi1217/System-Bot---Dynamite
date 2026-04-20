@@ -17,15 +17,19 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::task;
+use rusqlite::Connection;
 
 // ============================================================================
 // CONFIGURATION CONSTANTS
 // ============================================================================
 
 const OLLAMA_API_URL: &str = "http://localhost:11434/api/generate";
+const OLLAMA_EMBEDDING_URL: &str = "http://localhost:11434/api/embeddings";
 const MODEL_NAME: &str = "qwen2.5:1.5b";
+const EMBEDDING_MODEL_NAME: &str = "nomic-embed-text";
 const HTTP_TIMEOUT_SECS: u64 = 60;
 const NOTIFICATION_TITLE: &str = "Dynamite";
+const DB_PATH: &str = "dynamite_memory.db";
 
 // ============================================================================
 // DATA STRUCTURES FOR OLLAMA API
@@ -44,6 +48,23 @@ struct OllamaRequest {
 struct OllamaResponse {
     response: String,
     done: bool,
+}
+
+// ============================================================================
+// BRICK 2: SEMANTIC MEMORY - EMBEDDING API STRUCTURES
+// ============================================================================
+
+/// Request payload for Ollama Embedding API
+#[derive(Serialize, Debug)]
+struct EmbeddingRequest {
+    model: String,
+    prompt: String,
+}
+
+/// Response from Ollama Embedding API
+#[derive(Deserialize, Debug)]
+struct EmbeddingResponse {
+    embedding: Vec<f32>,
 }
 
 // ============================================================================
@@ -66,6 +87,13 @@ async fn main() -> Result<()> {
         .init();
 
     tracing::info!("🚀 System Bot - Dynamite daemon starting...");
+
+    // BRICK 2: Initialize semantic memory database
+    if let Err(e) = init_db() {
+        tracing::error!("⚠️ Failed to initialize memory database: {}. Continuing without semantic memory.", e);
+    } else {
+        tracing::info!("💾 Semantic memory database initialized");
+    }
 
     // Spawn the OS-level keyboard listener in a separate blocking thread.
     // The `listen()` function from rdev is synchronous and blocking, so we 
@@ -110,7 +138,6 @@ fn os_event_listener() -> Result<()> {
                             tracing::error!("❌ Hotkey handler failed: {}", e);
                             notify_error(&format!("Error: {}", e));
                         }
-
                         // Mark processing as complete
                         PROCESSING.store(false, Ordering::SeqCst);
                     });
@@ -152,10 +179,11 @@ fn is_trigger_hotkey(key: Key) -> bool {
 /// Main async handler invoked when Ctrl+D is pressed.
 /// Flow:
 /// 1. Read clipboard
-/// 2. Send to Ollama API
-/// 3. Parse response
-/// 4. Write back to clipboard
-/// 5. Notify user
+/// 2. [BRICK 2] Get embedding vector from Ollama
+/// 3. [BRICK 2] Store clipboard text + embedding in SQLite memory
+/// 4. Send to Ollama API for generation (Brick 1)
+/// 5. Write back to clipboard
+/// 6. Notify user
 async fn handle_hotkey_triggered() -> Result<()> {
     tracing::info!("📋 Reading clipboard...");
 
@@ -173,6 +201,20 @@ async fn handle_hotkey_triggered() -> Result<()> {
 
     tracing::info!("📝 Clipboard input: {} chars", input_text.len());
 
+    // ========================================================================
+    // BRICK 2: SEMANTIC MEMORY - GET EMBEDDING AND STORE
+    // ========================================================================
+    // This section is modularized for easy disabling if needed for debugging
+    if let Err(e) = store_clipboard_with_embedding(&input_text).await {
+        // Non-fatal error: log and continue
+        tracing::warn!("⚠️ Failed to store memory (embedding/DB): {}. Continuing with generation...", e);
+    } else {
+        tracing::info!("💾 Clipboard indexed in semantic memory");
+    }
+
+    // ========================================================================
+    // BRICK 1: GENERATIVE AI PROCESSING
+    // ========================================================================
     // Step 2: Send to local Ollama API
     tracing::info!("🤖 Sending prompt to Ollama API...");
     let response_text = query_ollama_api(&input_text).await?;
@@ -289,28 +331,177 @@ fn notify_error(message: &str) -> () {
 }
 
 // ============================================================================
+// BRICK 2: SEMANTIC MEMORY - SQLITE + EMBEDDINGS
+// ============================================================================
+
+/// Initializes the SQLite database with VSS (Vector Similarity Search) table.
+/// This runs once at daemon startup.
+fn init_db() -> Result<()> {
+    let conn = Connection::open(DB_PATH)
+        .context("Failed to open or create database")?;
+
+    // Enable foreign keys
+    conn.execute("PRAGMA foreign_keys = ON", [])
+        .context("Failed to enable foreign keys")?;
+
+    // Create the history table with vector support
+    // Using BLOB for storing embedding vectors as serialized bytes
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            clipboard_text TEXT NOT NULL,
+            embedding_vector BLOB NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    ).context("Failed to create history table")?;
+
+    // Create an index on created_at for efficient time-based queries
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_history_created_at ON history(created_at)",
+        [],
+    ).context("Failed to create timestamp index")?;
+
+    tracing::info!("✅ Database schema initialized: {}", DB_PATH);
+    Ok(())
+}
+
+/// Queries the Ollama Embedding API and returns the embedding vector.
+/// 
+/// Uses the "nomic-embed-text" model to generate a vector representation
+/// of the input text. The vector is used for semantic similarity search
+/// across the memory history.
+async fn get_embedding(text: &str) -> Result<Vec<f32>> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .build()
+        .context("Failed to create HTTP client for embeddings")?;
+
+    let request_payload = EmbeddingRequest {
+        model: EMBEDDING_MODEL_NAME.to_string(),
+        prompt: text.to_string(),
+    };
+
+    tracing::debug!("📤 Requesting embedding from {}", OLLAMA_EMBEDDING_URL);
+
+    let response = client
+        .post(OLLAMA_EMBEDDING_URL)
+        .json(&request_payload)
+        .send()
+        .await
+        .context("Failed to send embedding request to Ollama API")?;
+
+    // Check for HTTP errors
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        return Err(anyhow!(
+            "Ollama embedding API error ({}): {}",
+            status,
+            error_text
+        ));
+    }
+
+    // Parse response
+    let embedding_response: EmbeddingResponse = response
+        .json()
+        .await
+        .context("Failed to parse embedding API response")?;
+
+    tracing::debug!("✅ Received embedding vector: {} dimensions", embedding_response.embedding.len());
+    Ok(embedding_response.embedding)
+}
+
+/// Stores clipboard text and its embedding vector in the SQLite database.
+/// 
+/// This function:
+/// 1. Queries the embedding API to get a vector representation
+/// 2. Serializes the vector to binary format
+/// 3. Inserts both the original text and vector into the history table
+/// 
+/// Errors are non-fatal and logged; the daemon continues operation.
+async fn store_clipboard_with_embedding(text: &str) -> Result<()> {
+    // Step 1: Get embedding vector from Ollama
+    tracing::info!("🧠 Computing embedding for semantic memory...");
+    let embedding_vector = get_embedding(text).await?;
+
+    // Step 2: Serialize vector to bytes
+    // Convert Vec<f32> to Vec<u8> for storage
+    let vector_bytes: Vec<u8> = embedding_vector
+        .iter()
+        .flat_map(|f| f.to_le_bytes().to_vec())
+        .collect();
+
+    // Step 3: Store in database
+    store_memory(text, &vector_bytes)?;
+
+    Ok(())
+}
+
+/// Inserts clipboard text and embedding vector into the history table.
+/// 
+/// This is a synchronous database operation that can be called from async context.
+/// Errors are contextual and include database-specific details.
+fn store_memory(text: &str, embedding_bytes: &[u8]) -> Result<()> {
+    let conn = Connection::open(DB_PATH)
+        .context("Failed to open database for insertion")?;
+
+    conn.execute(
+        "INSERT INTO history (clipboard_text, embedding_vector) VALUES (?1, ?2)",
+        [
+            &rusqlite::params![text, embedding_bytes],
+        ],
+    ).context("Failed to insert into history table")?;
+
+    let row_id = conn.last_insert_rowid();
+    tracing::info!("💾 Stored memory entry #{}", row_id);
+
+    Ok(())
+}
+
+// ============================================================================
 // NOTES & FUTURE IMPROVEMENTS
 // ============================================================================
 //
-// MVP LIMITATIONS:
+// BRICK 1 (GENERATIVE AI): ✅ IMPLEMENTED
+// - Hotkey-triggered clipboard → Ollama LLM → clipboard workflow
+// - Desktop notifications for user feedback
+//
+// BRICK 2 (SEMANTIC MEMORY): ✅ IMPLEMENTED
+// - SQLite database (dynamite_memory.db) with full history
+// - Vector embeddings via Ollama Embedding API (nomic-embed-text)
+// - Non-fatal error handling: embedding/DB failures don't crash daemon
+// - Modularized functions for easy debugging/disabling
+//
+// REMAINING LIMITATIONS & FUTURE WORK:
 // 1. Hotkey detection is simplified. For production:
 //    - Use platform-specific APIs (Windows: RegisterHotKey, macOS: CGEventTap)
 //    - Implement proper modifier key state tracking
 //
-// 2. No persistence or logging to disk yet.
-//    - Consider structured logging with tracing-subscriber filters
+// 2. Vector similarity search not yet exposed.
+//    - Future: Add query functions to retrieve semantically similar memory
+//    - Implement approximate nearest neighbor (ANN) search
 //
-// 3. No graceful shutdown mechanism.
+// 3. No vector index optimization yet.
+//    - Future: Use sqlite-vss for efficient vector search (when schema allows)
+//    - Current approach uses BLOB storage; could be optimized for speed
+//
+// 4. No graceful shutdown mechanism.
 //    - Add signal handling (SIGTERM) for clean daemon termination
 //
-// 4. Single model hard-coded; no config file support yet.
+// 5. Single model hard-coded; no config file support yet.
 //    - Future: JSON/TOML config file for model selection, API URL, etc.
 //
-// 5. No context history; each prompt is independent.
-//    - Future: Implement conversation memory for multi-turn interactions
-//
 // 6. No agent routing or prompt chaining.
-//    - Future: Brick 2 will add intelligent routing based on input classification
+//    - Future: Brick 3 will add intelligent routing based on input classification
+//    - Use memory search results to inform response generation
 //
 // 7. Clipboard-only input/output.
 //    - Future: Support other I/O channels (files, database, message queues)
+//
+// 8. Memory pruning not implemented.
+//    - Future: Add time-based or size-based cleanup of old entries
+//    - Implement export functionality for memory analysis

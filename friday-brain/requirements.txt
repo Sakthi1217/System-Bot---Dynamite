@@ -1,0 +1,7 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+crewai==0.10.0
+langchain-community==0.0.10
+duckduckgo-search==3.9.10
+pydantic==2.5.0
+python-dotenv==1.0.0
